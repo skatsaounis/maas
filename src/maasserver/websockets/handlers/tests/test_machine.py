@@ -4005,7 +4005,9 @@ class TestMachineHandler(MAASServerTestCase):
         partition_table = destination2.current_config.blockdevice_set.first().get_partitiontable()
         self.assertIsNotNone(partition_table)
         partitions = partition_table.partitions
-        maybe_efi, maybe_root, *rest = partitions.all()
+        # Order by UUID to ensure deterministic partition retrieval
+        ordered_partitions = partitions.order_by("uuid").all()
+        maybe_efi, maybe_root, *rest = ordered_partitions
         self.assertEqual(rest, [])
         self.assertEqual(maybe_efi.size, efi_partition.size)
         self.assertTrue(maybe_efi.bootable)

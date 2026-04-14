@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 from unittest.mock import Mock
 
+from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
+from twisted.internet.task import deferLater
 
 import maascommon.worker as worker_module
 from maascommon.worker import get_worker_ids
@@ -248,6 +250,24 @@ class TestRegionHTTPService(
         self.addCleanup(listener.unregister, "sys_reverse_proxy", _handler)
         yield listener.startService()
         yield from self.create_tls_config()
+
+        # Poll for the notification to be received instead of arbitrary delay.
+        # This is deterministic: passes as soon as handler is called, fails
+        # with clear timeout if notification system is broken.
+        timeout = 2.0  # seconds
+        interval = 0.01  # 10ms polling interval
+        deadline = reactor.seconds() + timeout
+
+        while reactor.seconds() < deadline:
+            if len(capture) > 0:
+                break
+            yield deferLater(reactor, interval, lambda: None)
+        else:
+            self.fail(
+                f"Handler not called within {timeout}s. "
+                f"Expected ['sys_reverse_proxy'], got {capture}"
+            )
+
         try:
             self.assertEqual(capture, ["sys_reverse_proxy"])
         finally:

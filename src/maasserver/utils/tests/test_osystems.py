@@ -523,7 +523,17 @@ class TestGetReleaseVersionFromString(MAASServerTestCase):
             for row in ubuntu_rows
             if int(row["version"].split(".")[0]) >= 12
         ]
-        release = random.choice(valid_releases)
+        # Use sorted to pick oldest release (deterministic, matches production behavior).
+        # Production code (get_release_from_distro_info) returns FIRST match when
+        # searching by letter, e.g., "hwe-q" → quantal 12.10, not questing 25.10.
+        # This test uses old-style format (hwe-{letter}, deprecated since 16.04).
+        # Letter collisions exist: precise/plucky (p), quantal/questing (q), etc.
+        release = sorted(
+            valid_releases,
+            key=lambda r: tuple(
+                int(x) for x in r["version"].split(" ")[0].split(".")
+            ),
+        )[0]
         # Remove 'LTS' from version if it exists
         version_str = release["version"].split(" ")[0]
         # Convert the version into a list of ints
@@ -1056,7 +1066,16 @@ class TestGetReleaseFromDistroInfo(MAASServerTestCase):
             for release in ubuntu_rows
             if int(release["version"].split(".")[0]) >= 12
         ]
-        return random.choice(supported_releases)
+        # Use sorted to pick oldest release (deterministic, matches production behavior).
+        # Production code (get_release_from_distro_info) returns FIRST match when
+        # searching by prefix/letter. This ensures test expectations align with
+        # actual function behavior when multiple releases share starting letters.
+        return sorted(
+            supported_releases,
+            key=lambda r: tuple(
+                int(x) for x in r["version"].split(" ")[0].split(".")
+            ),
+        )[0]
 
     def test_finds_by_series(self):
         release = self.pick_release()
@@ -1097,7 +1116,16 @@ class TestGetReleaseFromDB(MAASServerTestCase):
             for release in ubuntu_rows
             if int(release["version"].split(".")[0]) >= 12
         ]
-        release = random.choice(supported_releases)
+        # Use sorted to pick oldest release (deterministic, matches production behavior).
+        # Production code (get_release_from_db) searches by prefix/subarch and may
+        # encounter multiple releases with same starting letter. Picking oldest ensures
+        # test data aligns with database query behavior (first match wins).
+        release = sorted(
+            supported_releases,
+            key=lambda r: tuple(
+                int(x) for x in r["version"].split(" ")[0].split(".")
+            ),
+        )[0]
         ga_or_hwe = random.choice(["hwe", "ga"])
         subarch = "{}-{}".format(ga_or_hwe, release["version"].split(" ")[0])
         factory.make_BootSourceCache(

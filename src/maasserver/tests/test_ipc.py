@@ -12,6 +12,7 @@ import uuid
 from fixtures import EnvironmentVariableFixture
 from twisted.internet import reactor
 from twisted.internet.defer import DeferredList, inlineCallbacks, succeed
+from twisted.internet.task import deferLater
 
 from maasserver import ipc, workers
 from maasserver.enum import SERVICE_STATUS
@@ -650,10 +651,39 @@ class TestIPCCommunication(MAASTransactionServerTestCase):
                 master._updateConnections, process, rpc_conns
             )
 
-        def _get_conn_count():
-            return RegionRackRPCConnection.objects.filter(
+        # Poll for the expected database state instead of arbitrary delay.
+        # This is deterministic: passes as soon as condition is met, fails
+        # with clear timeout if something is broken.
+        def check_connection_count():
+            count = RegionRackRPCConnection.objects.filter(
                 rack_controller=rack_controller
             ).count()
+            return count == 1
 
-        count = yield deferToDatabase(_get_conn_count)
+        timeout = 2.0  # seconds
+        interval = 0.01  # 10ms polling interval
+        deadline = reactor.seconds() + timeout
+
+        while reactor.seconds() < deadline:
+            count = yield deferToDatabase(check_connection_count)
+            if count:
+                break
+            yield deferLater(reactor, interval, lambda: None)
+        else:
+            # Timeout - get actual count for error message
+            actual_count = yield deferToDatabase(
+                lambda: RegionRackRPCConnection.objects.filter(
+                    rack_controller=rack_controller
+                ).count()
+            )
+            self.fail(
+                f"Expected 1 connection after {timeout}s, got {actual_count}"
+            )
+
+        # Final verification
+        count = yield deferToDatabase(
+            lambda: RegionRackRPCConnection.objects.filter(
+                rack_controller=rack_controller
+            ).count()
+        )
         self.assertEqual(count, 1)
