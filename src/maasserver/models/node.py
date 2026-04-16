@@ -6360,18 +6360,31 @@ class Node(CleanSave, TimestampedModel):
         # Avoid circular imports.
         from maasserver.models.event import Event
 
-        d = deferToDatabase(transactional(self.get_effective_power_info))
+        # Capture the BMC ID before starting power query to detect
+        # if the BMC changes during the async operation
+        @transactional
+        def get_initial_state():
+            node = Node.objects.get(id=self.id)
+            return (
+                node.bmc.id if node.bmc else None,
+                node.get_effective_power_info(),
+            )
 
-        def cb_query(power_info):
+        d = deferToDatabase(get_initial_state)
+
+        def cb_query(initial_state):
+            original_bmc_id, power_info = initial_state
             d = self._power_control_node(
                 succeed(None), POWER_WORKFLOW_ACTIONS.QUERY, power_info
             )
-            d.addCallback(lambda result: (result, power_info))
+            d.addCallback(
+                lambda result: (result, power_info, original_bmc_id)
+            )
             return d
 
         @transactional
         def cb_create_event(result):
-            response, _ = result
+            response, _, _ = result
             power_state = response["state"]
             power_error = (
                 response["error_msg"] if "error_msg" in response else None
@@ -6391,13 +6404,29 @@ class Node(CleanSave, TimestampedModel):
             return result
 
         def cb_update_power(result):
-            response, power_info = result
+            response, power_info, original_bmc_id = result
             power_state = response["state"]
             if power_info.can_be_queried and self.power_state != power_state:
 
                 @transactional
                 def cb_update_queryable_node():
                     node = Node.objects.get(id=self.id)
+
+                    # Verify BMC hasn't changed during the power query.
+                    # If it has, the power state is from the wrong BMC
+                    # and should be discarded.
+                    current_bmc_id = node.bmc.id if node.bmc else None
+                    if current_bmc_id != original_bmc_id:
+                        maaslog.warning(
+                            "%s: BMC changed during power query "
+                            "(from id=%s to id=%s), discarding stale "
+                            "power state",
+                            node.hostname,
+                            original_bmc_id,
+                            current_bmc_id,
+                        )
+                        return power_state
+
                     node.update_power_state(power_state)
                     return power_state
 
@@ -6407,6 +6436,20 @@ class Node(CleanSave, TimestampedModel):
                 @transactional
                 def cb_update_non_queryable_node():
                     node = Node.objects.get(id=self.id)
+
+                    # Verify BMC hasn't changed during the power query.
+                    current_bmc_id = node.bmc.id if node.bmc else None
+                    if current_bmc_id != original_bmc_id:
+                        maaslog.warning(
+                            "%s: BMC changed during power query "
+                            "(from id=%s to id=%s), discarding stale "
+                            "power state",
+                            node.hostname,
+                            original_bmc_id,
+                            current_bmc_id,
+                        )
+                        return POWER_STATE.UNKNOWN
+
                     node.update_power_state(POWER_STATE.UNKNOWN)
                     return POWER_STATE.UNKNOWN
 
@@ -6444,30 +6487,65 @@ class Node(CleanSave, TimestampedModel):
 
         def cb_update_routable_racks(accessible):
             if not accessible:
-                # Perform power query on all of the rack controllers to
-                # determine which has access to this node's BMC.
-                d = power_query_all(self.system_id, self.hostname, power_info)
-
+                # Capture the BMC ID before starting the query to detect
+                # if the BMC changes during the async operation
                 @transactional
-                def cb_update_routable(result):
+                def get_bmc_id():
                     node = Node.objects.get(id=self.id)
-                    power_state, routable_racks, non_routable_racks = result
-                    if (
-                        power_info.can_be_queried
-                        and node.power_state != power_state
-                    ):
-                        # MAAS will query power types that even say they don't
-                        # support query. But we only update the power_state on
-                        # those we are saying MAAS reports on.
-                        node.update_power_state(power_state)
-                    node.bmc.update_routable_racks(
-                        routable_racks, non_routable_racks
+                    return node.bmc.id if node.bmc else None
+
+                d = deferToDatabase(get_bmc_id)
+
+                def start_power_query(original_bmc_id):
+                    # Perform power query on all of the rack controllers to
+                    # determine which has access to this node's BMC.
+                    query_d = power_query_all(
+                        self.system_id, self.hostname, power_info
                     )
 
-                # Update the routable information for the BMC.
-                d.addCallback(
-                    partial(deferToDatabase, transactional(cb_update_routable))
-                )
+                    @transactional
+                    def cb_update_routable(result):
+                        node = Node.objects.get(id=self.id)
+                        power_state, routable_racks, non_routable_racks = (
+                            result
+                        )
+
+                        # Verify BMC hasn't changed during the query.
+                        # If it has, the routing information is for the wrong
+                        # BMC and should be discarded.
+                        current_bmc_id = node.bmc.id if node.bmc else None
+                        if current_bmc_id != original_bmc_id:
+                            maaslog.warning(
+                                "%s: BMC changed during power query "
+                                "(from id=%s to id=%s), discarding stale "
+                                "routing information",
+                                node.hostname,
+                                original_bmc_id,
+                                current_bmc_id,
+                            )
+                            return
+
+                        if (
+                            power_info.can_be_queried
+                            and node.power_state != power_state
+                        ):
+                            # MAAS will query power types that even say they don't
+                            # support query. But we only update the power_state on
+                            # those we are saying MAAS reports on.
+                            node.update_power_state(power_state)
+                        node.bmc.update_routable_racks(
+                            routable_racks, non_routable_racks
+                        )
+
+                    # Update the routable information for the BMC.
+                    query_d.addCallback(
+                        partial(
+                            deferToDatabase, transactional(cb_update_routable)
+                        )
+                    )
+                    return query_d
+
+                d.addCallback(start_power_query)
                 return d
 
         # Update routable racks only if the BMC is not accessible.
@@ -6512,52 +6590,79 @@ class Node(CleanSave, TimestampedModel):
                     order,
                 )
             if power_method_name:
-                d.addCallback(
-                    lambda _: deferToDatabase(
+                # Capture the BMC ID before starting the Temporal workflow
+                # to detect if the BMC changes during workflow execution
+                @transactional
+                def get_workflow_bmc_id():
+                    node = Node.objects.get(id=self.id)
+                    return node.bmc.id if node.bmc else None
+
+                d.addCallback(lambda _: deferToDatabase(get_workflow_bmc_id))
+
+                def start_power_workflow(original_bmc_id):
+                    workflow_d = deferToDatabase(
                         convert_power_action_to_power_workflow,
                         power_method_name.replace("_", "-"),
                         self,
                         power_info,
                         self.is_dpu,
-                    ),
-                )
-
-                @inlineCallbacks
-                def exec_power_workflow(workflow_info):
-                    workflow_name, workflow_param = workflow_info
-                    try:
-                        res = yield execute_workflow(
-                            workflow_name,
-                            task_queue="region",
-                            param=workflow_param,
-                        )
-                        returnValue(res)
-                    except WorkflowFailureError as e:
-                        cause = getattr(e.cause, "cause", e.cause)
-                        raise PowerActionFail(cause)  # noqa: B904
-
-                d.addCallback(exec_power_workflow)
-
-                def _handle_workflow_result(result):
-                    if result:
-                        # workflow assumes bulk execution, return only result
-                        return result
-                    else:
-                        return {"state": POWER_STATE.UNKNOWN}
-
-                d.addCallback(_handle_workflow_result)
-
-                @transactional
-                def _update_node_power_state(result):
-                    node = Node.objects.get(id=self.id)
-                    node.update_power_state(result.get("state"))
-                    return result
-
-                d.addCallback(
-                    lambda result: deferToDatabase(
-                        _update_node_power_state, result
                     )
-                )
+
+                    @inlineCallbacks
+                    def exec_power_workflow(workflow_info):
+                        workflow_name, workflow_param = workflow_info
+                        try:
+                            res = yield execute_workflow(
+                                workflow_name,
+                                task_queue="region",
+                                param=workflow_param,
+                            )
+                            returnValue(res)
+                        except WorkflowFailureError as e:
+                            cause = getattr(e.cause, "cause", e.cause)
+                            raise PowerActionFail(cause)  # noqa: B904
+
+                    workflow_d.addCallback(exec_power_workflow)
+
+                    def _handle_workflow_result(result):
+                        if result:
+                            # workflow assumes bulk execution, return only result
+                            return result
+                        else:
+                            return {"state": POWER_STATE.UNKNOWN}
+
+                    workflow_d.addCallback(_handle_workflow_result)
+
+                    @transactional
+                    def _update_node_power_state(result):
+                        node = Node.objects.get(id=self.id)
+
+                        # Verify BMC hasn't changed during the workflow.
+                        # If it has, the power state is from the wrong BMC
+                        # and should be discarded.
+                        current_bmc_id = node.bmc.id if node.bmc else None
+                        if current_bmc_id != original_bmc_id:
+                            maaslog.warning(
+                                "%s: BMC changed during power workflow "
+                                "(from id=%s to id=%s), discarding stale "
+                                "power state",
+                                node.hostname,
+                                original_bmc_id,
+                                current_bmc_id,
+                            )
+                            return result
+
+                        node.update_power_state(result.get("state"))
+                        return result
+
+                    workflow_d.addCallback(
+                        lambda result: deferToDatabase(
+                            _update_node_power_state, result
+                        )
+                    )
+                    return workflow_d
+
+                d.addCallback(start_power_workflow)
 
             return d
 
