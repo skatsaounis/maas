@@ -123,20 +123,23 @@ class TestGetRunningPIDsWithCommand(MAASTestCase):
     def test_returns_processes_running_on_host_not_container(self):
         command = factory.make_name("command")
 
-        ps_output = (
-            "  PID COMMAND\n"
-            "   1 init\n"
-            "   malformedline\n"
-            "   malformed line\n"
-            "   10 othercmd\n"
-            "   20 %s\n"
-            "   30 %s\n"
-            "   40 %s\n"
-            "   50 anothercmd\n" % (command, command, command)
-        )
+        proc_path = self.make_dir()
 
-        mock_run_command = self.patch(ps_module, "run_command")
-        mock_run_command.return_value = Mock(stdout=ps_output, returncode=0)
+        # Create fake process directories
+        processes = {
+            1: "init",
+            10: "othercmd",
+            20: command,
+            30: command,
+            40: command,
+            50: "anothercmd",
+        }
+
+        for pid, cmd in processes.items():
+            pid_dir = os.path.join(proc_path, str(pid))
+            os.mkdir(pid_dir)
+            comm_file = os.path.join(pid_dir, "comm")
+            atomic_write(cmd.encode("utf-8"), comm_file)
 
         mock_running_in_container = self.patch(
             ps_module, "running_in_container"
@@ -148,26 +151,29 @@ class TestGetRunningPIDsWithCommand(MAASTestCase):
             lambda pid, proc_path: pid == 30
         )  # Simulate PID 30 is in a container
 
-        result = get_running_pids_with_command(command)
+        result = get_running_pids_with_command(command, proc_path=proc_path)
 
         self.assertCountEqual(result, [20, 40])
-
-        mock_run_command.assert_called_once_with("ps", "-eo", "pid,comm")
 
     def test_returns_processes_when_running_in_container(self):
         command = factory.make_name("command")
 
-        ps_output = (
-            "  PID COMMAND\n"
-            "   10 %s\n"
-            "   20 %s\n"
-            "   30 %s\n"
-            "   40 othercmd\n"
-            "   50 anothercmd\n" % (command, command, command)
-        )
+        proc_path = self.make_dir()
 
-        mock_run_command = self.patch(ps_module, "run_command")
-        mock_run_command.return_value = Mock(stdout=ps_output, returncode=0)
+        # Create fake process directories
+        processes = {
+            10: command,
+            20: command,
+            30: command,
+            40: "othercmd",
+            50: "anothercmd",
+        }
+
+        for pid, cmd in processes.items():
+            pid_dir = os.path.join(proc_path, str(pid))
+            os.mkdir(pid_dir)
+            comm_file = os.path.join(pid_dir, "comm")
+            atomic_write(cmd.encode("utf-8"), comm_file)
 
         mock_running_in_container = self.patch(
             ps_module, "running_in_container"
@@ -176,9 +182,8 @@ class TestGetRunningPIDsWithCommand(MAASTestCase):
 
         mock_is_pid_in_container = self.patch(ps_module, "is_pid_in_container")
 
-        result = get_running_pids_with_command(command)
+        result = get_running_pids_with_command(command, proc_path=proc_path)
 
         self.assertCountEqual(result, [10, 20, 30])
 
-        mock_run_command.assert_called_once_with("ps", "-eo", "pid,comm")
         mock_is_pid_in_container.assert_not_called()

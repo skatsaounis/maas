@@ -7,11 +7,7 @@ from functools import lru_cache
 import os
 
 from provisioningserver.utils.fs import read_text_file
-from provisioningserver.utils.shell import (
-    call_and_check,
-    ExternalProcessError,
-    run_command,
-)
+from provisioningserver.utils.shell import call_and_check, ExternalProcessError
 
 
 def is_pid_running(pid):
@@ -67,15 +63,22 @@ def get_running_pids_with_command(
     :param exclude_container_processes: Excludes processes that are running
         in an LXC container on the host.
     """
-    result = run_command("ps", "-eo", "pid,comm")
     pids = []
-    for line in result.stdout.splitlines()[1:]:
-        try:
-            pid_str, cmd = line.strip().split(None, 1)
-            if cmd == command:
-                pids.append(int(pid_str))
-        except ValueError:  # malformed line
-            continue
+    try:
+        for entry in os.listdir(proc_path):
+            if not entry.isdigit():
+                continue
+            try:
+                pid = int(entry)
+                comm_path = os.path.join(proc_path, entry, "comm")
+                cmd = read_text_file(comm_path).strip()
+                if cmd == command:
+                    pids.append(pid)
+            except FileNotFoundError:
+                # Process disappeared between listing and reading
+                continue
+    except OSError:
+        return []
 
     if exclude_container_processes and not running_in_container():
         return [
